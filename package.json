@@ -1,0 +1,27 @@
+{
+  "name": "infinity-v3-core",
+  "private": true,
+  "version": "3.0.1",
+  "type": "module",
+  "scripts": {
+    "start": "vite . --port 3000 --strictPort",
+    "dev": "vite . --port 3000 --strictPort",
+    "build": "vite build .",
+    "preview": "vite preview",
+    "server": "node src/server/index.js",
+    "client": "vite . --port 3000 --strictPort",
+    "bake:organic-map": "node scripts/generateOrganicMapChunks.mjs",
+    "bake:organic-map:spawn": "node scripts/generateOrganicMapChunks.mjs --radius 4 --center spawn",
+    "bake:organic-map:all": "node scripts/generateOrganicMapChunks.mjs --all",
+    "test": "node test/runner.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "pixi.js": "^8.1.0",
+    "socket.io": "^4.7.5",
+    "socket.io-client": "^4.7.5"
+  },
+  "devDependencies": {
+    "vite": "^5.2.11"
+  }
+}

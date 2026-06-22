@@ -1,0 +1,1031 @@
+import * as PIXI from 'pixi.js';
+import { organicTerrainConfig, ORGANIC_MAP_RENDER_MODE } from './organicTerrainConfig.js';
+import { OrganicChunkDiskCache } from './OrganicChunkDiskCache.js';
+import { OrganicTerrainField } from './OrganicTerrainField.js';
+import { getOrganicTerrainOverridesHash } from './OrganicTerrainOverrides.js';
+
+const CHUNK_STATES = {
+  QUEUED_DISK_LOAD: 'queued_disk_load',
+  LOADING_FROM_DISK: 'loading_from_disk',
+  QUEUED_GENERATION: 'queued_generation',
+  QUEUED: 'queued',
+  BUILDING: 'building',
+  READY: 'ready',
+  FAILED: 'failed'
+};
+
+function chunkKey(chunkX, chunkY) {
+  return `${chunkX},${chunkY}`;
+}
+
+class OrganicMapChunk {
+  constructor(renderer, chunkX, chunkY) {
+    this.renderer = renderer;
+    this.chunkX = chunkX;
+    this.chunkY = chunkY;
+    this.key = chunkKey(chunkX, chunkY);
+    this.size = renderer.chunkSizePx;
+    this.cellSize = renderer.visualCellSize;
+    this.worldX = chunkX * this.size;
+    this.worldY = chunkY * this.size;
+    this.state = CHUNK_STATES.QUEUED;
+    this.priority = 0;
+    this.buildY = 0;
+    this.buildStartedAt = 0;
+    this.imageData = null;
+    this.visualLayerCounts = {};
+    this.cacheKey = renderer.getPersistentChunkKey(chunkX, chunkY);
+
+    this.canvas = document.createElement('canvas');
+    this.canvas.width = this.size;
+    this.canvas.height = this.size;
+    this.ctx = this.canvas.getContext('2d');
+    this.ctx.imageSmoothingEnabled = false;
+    this.drawPlaceholder();
+
+    this.texture = PIXI.Texture.from(this.canvas);
+    if (this.texture.source) {
+      this.texture.source.scaleMode = 'linear';
+    }
+
+    this.sprite = new PIXI.Sprite(this.texture);
+    this.sprite.x = this.worldX;
+    this.sprite.y = this.worldY;
+    this.sprite.width = this.size;
+    this.sprite.height = this.size;
+  }
+
+  drawPlaceholder() {
+    if (!this.renderer.config.placeholderEnabled) {
+      this.ctx.fillStyle = this.renderer.config.colors.deep_water;
+      this.ctx.fillRect(0, 0, this.size, this.size);
+      return;
+    }
+
+    const centerX = this.worldX + this.size * 0.5;
+    const centerY = this.worldY + this.size * 0.5;
+    const sample = this.renderer.field.sampleOrganicTerrainAtWorld(centerX, centerY);
+
+    this.ctx.fillStyle = `rgb(${Math.round(sample.color.r)}, ${Math.round(sample.color.g)}, ${Math.round(sample.color.b)})`;
+    this.ctx.fillRect(0, 0, this.size, this.size);
+  }
+
+  startBuild() {
+    if (this.state === CHUNK_STATES.READY) return;
+
+    this.state = CHUNK_STATES.BUILDING;
+    this.buildStartedAt = performance.now();
+    this.buildY = 0;
+    this.visualLayerCounts = {};
+    this.imageData = this.ctx.createImageData(this.size, this.size);
+  }
+
+  buildStep(deadlineMs) {
+    if (this.state === CHUNK_STATES.READY) return true;
+    if (this.state !== CHUNK_STATES.BUILDING) this.startBuild();
+
+    let rowsDrawn = 0;
+
+    while (this.buildY < this.size && (performance.now() < deadlineMs || rowsDrawn === 0)) {
+      this.drawCellRow(this.buildY);
+      this.buildY += this.cellSize;
+      rowsDrawn++;
+    }
+
+    if (this.buildY >= this.size) {
+      this.finishBuild();
+      return true;
+    }
+
+    return false;
+  }
+
+  buildSync() {
+    if (this.state === CHUNK_STATES.READY) return;
+
+    this.startBuild();
+
+    while (this.buildY < this.size) {
+      this.drawCellRow(this.buildY);
+      this.buildY += this.cellSize;
+    }
+
+    this.finishBuild();
+  }
+
+  drawCellRow(y) {
+    const data = this.imageData.data;
+    const field = this.renderer.field;
+    const cellSize = this.cellSize;
+    const supersampling = this.renderer.supersampling;
+
+    for (let x = 0; x < this.size; x += cellSize) {
+      const sample = field.sampleOrganicTerrainCellAtWorld(
+        this.worldX + x,
+        this.worldY + y,
+        cellSize,
+        supersampling
+      );
+      const r = Math.max(0, Math.min(255, Math.round(sample.color.r)));
+      const g = Math.max(0, Math.min(255, Math.round(sample.color.g)));
+      const b = Math.max(0, Math.min(255, Math.round(sample.color.b)));
+
+      this.visualLayerCounts[sample.visualLayer] = (this.visualLayerCounts[sample.visualLayer] ?? 0) + 1;
+
+      for (let py = 0; py < cellSize; py++) {
+        const pixelY = y + py;
+        if (pixelY >= this.size) break;
+
+        for (let px = 0; px < cellSize; px++) {
+          const pixelX = x + px;
+          if (pixelX >= this.size) break;
+
+          const index = (pixelY * this.size + pixelX) * 4;
+          data[index] = r;
+          data[index + 1] = g;
+          data[index + 2] = b;
+          data[index + 3] = 255;
+        }
+      }
+    }
+  }
+
+  finishBuild() {
+    const elapsed = performance.now() - this.buildStartedAt;
+
+    this.ctx.putImageData(this.imageData, 0, 0);
+    this.imageData = null;
+    this.state = CHUNK_STATES.READY;
+
+    if (this.sprite.texture.source?.update) {
+      this.sprite.texture.source.update();
+    }
+
+    this.renderer.recordChunkMetrics(elapsed, this.visualLayerCounts);
+  }
+
+  async restoreFromBlob(blob) {
+    try {
+      let image = null;
+
+      if (typeof createImageBitmap === 'function') {
+        image = await createImageBitmap(blob);
+      } else {
+        image = await new Promise((resolve, reject) => {
+          const url = URL.createObjectURL(blob);
+          const img = new Image();
+
+          img.onload = () => {
+            URL.revokeObjectURL(url);
+            resolve(img);
+          };
+          img.onerror = (error) => {
+            URL.revokeObjectURL(url);
+            reject(error);
+          };
+          img.src = url;
+        });
+      }
+
+      this.ctx.clearRect(0, 0, this.size, this.size);
+      this.ctx.drawImage(image, 0, 0, this.size, this.size);
+
+      if (image?.close) {
+        image.close();
+      }
+
+      this.state = CHUNK_STATES.READY;
+
+      if (this.sprite.texture.source?.update) {
+        this.sprite.texture.source.update();
+      }
+
+      return true;
+    } catch (error) {
+      console.warn('[OrganicMapChunk] Falha ao restaurar chunk do cache:', error);
+      this.state = CHUNK_STATES.QUEUED_GENERATION;
+      return false;
+    }
+  }
+
+  async toBlob(format, quality, fallbackFormat) {
+    const blob = await new Promise((resolve) => {
+      this.canvas.toBlob(resolve, format, quality);
+    });
+
+    if (blob) return blob;
+
+    return new Promise((resolve) => {
+      this.canvas.toBlob(resolve, fallbackFormat);
+    });
+  }
+
+  destroy() {
+    if (this.sprite.parent) {
+      this.sprite.parent.removeChild(this.sprite);
+    }
+
+    this.sprite.destroy({ children: false, texture: true });
+  }
+}
+
+export class OrganicMapRenderer {
+  constructor(container, options = {}) {
+    this.container = container;
+    this.config = {
+      ...organicTerrainConfig,
+      ...options
+    };
+    this.field = new OrganicTerrainField(this.config);
+    this.overrideHash = getOrganicTerrainOverridesHash();
+    this.chunkSizePx = this.config.chunkSizePx;
+    this.visualCellSize = this.config.visualCellSize;
+    this.supersampling = Math.max(1, Math.floor(this.config.supersampling ?? 1));
+    this.runtimeChunkBudgetMs = this.config.runtimeChunkBudgetMs;
+    this.maxChunksBuiltPerFrame = this.config.maxChunksBuiltPerFrame;
+    this.chunks = new Map();
+    this.chunkCache = this.chunks;
+    this.pendingChunks = new Set();
+    this.buildingChunks = new Set();
+    this.chunkQueue = [];
+    this.diskLoadQueue = [];
+    this.pendingDiskLoads = new Set();
+    this.loadingDiskChunks = new Set();
+    this.currentBuildChunk = null;
+    this.activeSprites = new Set();
+    this.lastCamera = null;
+    this.diskCache = null;
+    this.bakedManifest = null;
+    this.bakedBasePath = '';
+    this.bakedImageQueue = [];
+    this.pendingBakedImages = new Set();
+    this.loadingBakedImages = new Set();
+
+    this.installOrganicTerrainOverrideListener();
+
+    this.metrics = {
+      renderMode: ORGANIC_MAP_RENDER_MODE,
+      organicMapPrototype: true,
+      chunksCreated: 0,
+      chunksBuilt: 0,
+      chunksCached: 0,
+      chunksVisible: 0,
+      queuedChunks: 0,
+      buildingChunks: 0,
+      queuedDiskLoads: 0,
+      chunksBuiltThisFrame: 0,
+      chunkCreateMsAvg: 0,
+      chunkCreateMsTotal: 0,
+      avgChunkBuildMs: 0,
+      lastChunkBuildMs: 0,
+      visualCellSize: this.visualCellSize,
+      supersampling: this.supersampling,
+      smoothBandEdges: !!this.config.smoothBandEdges,
+      bandBlendWidth: this.config.bandBlendWidth,
+      chunkSizePx: this.chunkSizePx,
+      visualLayerCounts: {},
+      fallbackSolidChunks: 0,
+      cacheHits: 0,
+      cacheMisses: 0,
+      prewarmDiskHits: 0,
+      prewarmGenerated: 0,
+      prewarmProgress: 0,
+      prewarmTotal: 0,
+      runtimeBudgetMs: this.runtimeChunkBudgetMs,
+      diskCache: {
+        enabled: false,
+        ready: false,
+        hits: 0,
+        misses: 0,
+        writes: 0,
+        errors: 0,
+        prunedChunks: 0,
+        estimatedUsage: 0,
+        estimatedQuota: 0,
+        persisted: false,
+        configHash: '-',
+        cacheVersion: this.config.cacheVersion ?? '-'
+      },
+      bakedCache: {
+        enabled: !!this.config.bakedChunksEnabled,
+        ready: false,
+        hits: 0,
+        misses: 0,
+        errors: 0,
+        configHash: '-'
+      },
+      placeholderEnabled: !!this.config.placeholderEnabled,
+      updatesExecuted: 0,
+      updatesSkipped: 0,
+      organic: {
+        visualCellSize: this.visualCellSize,
+        supersampling: this.supersampling,
+        chunkCreateMsAvg: 0,
+        visibleChunks: 0,
+        cachedChunks: 0,
+        queuedChunks: 0,
+        buildingChunks: 0,
+        queuedDiskLoads: 0,
+        queuedBuilds: 0,
+        chunksBuiltThisFrame: 0,
+        avgChunkBuildMs: 0,
+        lastChunkBuildMs: 0,
+        prewarmProgress: 0,
+        prewarmTotal: 0,
+        prewarmDiskHits: 0,
+        prewarmGenerated: 0,
+        runtimeBudgetMs: this.runtimeChunkBudgetMs,
+        cacheHits: 0,
+        cacheMisses: 0,
+        diskCache: null,
+        bakedCache: null,
+        configHash: '-',
+        cacheVersion: this.config.cacheVersion ?? '-'
+      }
+    };
+  }
+
+  installOrganicTerrainOverrideListener() {
+    if (typeof window === 'undefined' || this.organicTerrainOverrideListenerInstalled) return;
+
+    this.organicTerrainOverrideListenerInstalled = true;
+
+    window.addEventListener('organic-terrain-overrides-changed', (event) => {
+      const detail = event.detail ?? {};
+      this.overrideHash = getOrganicTerrainOverridesHash();
+
+      // Evita carregar chunks antigos do IndexedDB/bake depois de editar o mapa.
+      this.diskCache = null;
+      this.bakedManifest = null;
+      this.config.persistentCacheEnabled = false;
+      this.config.bakedChunksEnabled = false;
+
+      if (Number.isFinite(detail.x) && Number.isFinite(detail.y)) {
+        this.invalidateChunksInRadius(detail.x, detail.y, (detail.radius ?? 0) + this.chunkSizePx * 2, 'terrain_overrides');
+      } else {
+        this.invalidateAllChunks('terrain_overrides');
+      }
+    });
+  }
+
+  invalidateAllChunks(reason = 'manual') {
+    this.currentBuildChunk = null;
+    this.chunkQueue.length = 0;
+    this.diskLoadQueue.length = 0;
+    this.bakedImageQueue.length = 0;
+    this.pendingChunks.clear();
+    this.buildingChunks.clear();
+    this.pendingDiskLoads.clear();
+    this.loadingDiskChunks.clear();
+    this.pendingBakedImages.clear();
+    this.loadingBakedImages.clear();
+    this.activeSprites.clear();
+
+    for (const chunk of this.chunks.values()) {
+      chunk.destroy();
+    }
+
+    this.chunks.clear();
+    this.metrics.cacheMisses++;
+    this.metrics.lastInvalidationReason = reason;
+    this.updateMetrics();
+  }
+
+  invalidateChunksInRadius(worldX, worldY, radius = this.chunkSizePx * 3, reason = 'manual') {
+    if (!Number.isFinite(worldX) || !Number.isFinite(worldY) || !Number.isFinite(radius)) {
+      this.invalidateAllChunks(reason);
+      return;
+    }
+
+    const affected = [];
+    const extra = this.chunkSizePx * 0.75;
+    const maxDistance = radius + extra;
+
+    for (const [key, chunk] of this.chunks.entries()) {
+      const centerX = chunk.worldX + this.chunkSizePx * 0.5;
+      const centerY = chunk.worldY + this.chunkSizePx * 0.5;
+      const distance = Math.hypot(centerX - worldX, centerY - worldY);
+
+      if (distance <= maxDistance) {
+        affected.push([key, chunk]);
+      }
+    }
+
+    for (const [key, chunk] of affected) {
+      this.pendingChunks.delete(key);
+      this.buildingChunks.delete(key);
+      this.pendingDiskLoads.delete(key);
+      this.loadingDiskChunks.delete(key);
+      this.pendingBakedImages.delete(key);
+      this.loadingBakedImages.delete(key);
+      this.chunkQueue = this.chunkQueue.filter((queued) => queued.key !== key);
+      this.diskLoadQueue = this.diskLoadQueue.filter((queued) => queued.key !== key);
+      this.bakedImageQueue = this.bakedImageQueue.filter((queued) => queued.key !== key);
+
+      if (this.currentBuildChunk?.key === key) {
+        this.currentBuildChunk = null;
+      }
+
+      chunk.destroy();
+      this.chunks.delete(key);
+    }
+
+    this.metrics.lastInvalidationReason = reason;
+    this.metrics.lastInvalidatedChunks = affected.length;
+    this.updateMetrics();
+  }
+
+  async initDiskCache() {
+    if (this.diskCache || !this.config.persistentCacheEnabled) {
+      return !!this.diskCache?.ready;
+    }
+
+    this.diskCache = new OrganicChunkDiskCache(this.config);
+    const ready = await this.diskCache.open();
+    this.metrics.diskCache = this.diskCache.metrics;
+    this.metrics.organic.diskCache = this.diskCache.metrics;
+    this.metrics.organic.configHash = this.diskCache.configHash;
+    this.metrics.organic.cacheVersion = this.diskCache.cacheVersion;
+
+    if (typeof window !== 'undefined') {
+      window.infinityDebug = window.infinityDebug ?? {};
+      window.infinityDebug.clearOrganicMapCache = async () => {
+        await this.diskCache?.clearCurrentVersion();
+        console.info('[Infinity V3] Cache organico local limpo.');
+      };
+      window.infinityDebug.clearAllOrganicMapCache = async () => {
+        await this.diskCache?.clearAll();
+        console.info('[Infinity V3] Todo o cache organico local foi limpo.');
+      };
+    }
+
+    return ready;
+  }
+
+  async initBakedChunkCache() {
+    if (!this.config.bakedChunksEnabled || this.bakedManifest) {
+      return !!this.bakedManifest;
+    }
+
+    try {
+      const version = this.config.cacheVersion;
+      const url = `/generated/organic-map/${version}/manifest.json`;
+      const response = await fetch(url, { cache: 'force-cache' });
+
+      if (!response.ok) {
+        this.metrics.bakedCache.misses++;
+        return false;
+      }
+
+      const manifest = await response.json();
+      const expectedHash = this.diskCache?.configHash ?? null;
+
+      if (
+        manifest.version !== version ||
+        (expectedHash && manifest.configHash !== expectedHash)
+      ) {
+        this.metrics.bakedCache.misses++;
+        return false;
+      }
+
+      this.bakedManifest = manifest;
+      this.bakedBasePath = `/generated/organic-map/${version}/`;
+      this.metrics.bakedCache.ready = true;
+      this.metrics.bakedCache.configHash = manifest.configHash;
+      this.updateMetrics();
+      return true;
+    } catch (error) {
+      console.warn('[OrganicMapRenderer] Manifest pre-gerado indisponivel:', error);
+      this.metrics.bakedCache.errors++;
+      return false;
+    }
+  }
+
+  getBakedChunkPath(chunkX, chunkY) {
+    const relativePath = this.bakedManifest?.chunks?.[chunkKey(chunkX, chunkY)];
+
+    return relativePath ? `${this.bakedBasePath}${relativePath}` : null;
+  }
+
+  getPersistentChunkKey(chunkX, chunkY) {
+    return this.diskCache?.getKey(chunkX, chunkY) ?? `${chunkX},${chunkY}`;
+  }
+
+  render(camera) {
+    this.lastCamera = camera;
+    const bounds = camera.getViewportWorldBounds(0);
+    const preload = this.config.runtimePreloadRadiusChunks;
+    const minChunkX = Math.floor(bounds.minX / this.chunkSizePx) - preload;
+    const maxChunkX = Math.floor(bounds.maxX / this.chunkSizePx) + preload;
+    const minChunkY = Math.floor(bounds.minY / this.chunkSizePx) - preload;
+    const maxChunkY = Math.floor(bounds.maxY / this.chunkSizePx) + preload;
+
+    this.activeSprites.clear();
+
+    for (let cy = minChunkY; cy <= maxChunkY; cy++) {
+      for (let cx = minChunkX; cx <= maxChunkX; cx++) {
+        const chunk = this.getOrCreateChunk(cx, cy, { camera });
+        chunk.sprite.visible = true;
+        this.activeSprites.add(chunk.sprite);
+
+        if (!chunk.sprite.parent) {
+          this.container.addChild(chunk.sprite);
+        }
+      }
+    }
+
+    for (const chunk of this.chunks.values()) {
+      if (!this.activeSprites.has(chunk.sprite)) {
+        chunk.sprite.visible = false;
+      }
+    }
+
+    this.container.pivot.set(camera.x, camera.y);
+    this.processBakedImageQueue(camera);
+    this.processDiskLoadQueue(camera);
+    this.processBuildQueue(this.runtimeChunkBudgetMs, camera);
+    this.trimCache(camera);
+    this.updateMetrics();
+    this.metrics.updatesExecuted++;
+  }
+
+  getOrCreateChunk(cx, cy, options = {}) {
+    const key = chunkKey(cx, cy);
+    let chunk = this.chunks.get(key);
+
+    if (chunk) {
+      if (chunk.state === CHUNK_STATES.READY) {
+        this.metrics.cacheHits++;
+      } else if (options.buildNow) {
+        this.pendingDiskLoads.delete(chunk.key);
+        this.loadingDiskChunks.delete(chunk.key);
+        this.pendingChunks.delete(chunk.key);
+        this.buildingChunks.delete(chunk.key);
+        this.diskLoadQueue = this.diskLoadQueue.filter((queued) => queued.key !== chunk.key);
+        this.chunkQueue = this.chunkQueue.filter((queued) => queued.key !== chunk.key);
+        chunk.buildSync();
+      }
+
+      return chunk;
+    }
+
+    chunk = new OrganicMapChunk(this, cx, cy);
+    this.chunks.set(key, chunk);
+    this.metrics.chunksCreated++;
+    this.metrics.cacheMisses++;
+
+    if (options.buildNow) {
+      chunk.buildSync();
+    } else if (this.getBakedChunkPath(cx, cy)) {
+      this.enqueueBakedImageLoad(chunk, options.camera ?? this.lastCamera);
+    } else if (this.diskCache?.ready) {
+      this.enqueueDiskLoad(chunk, options.camera ?? this.lastCamera);
+    } else {
+      this.enqueueChunkGeneration(chunk, options.camera ?? this.lastCamera);
+    }
+
+    return chunk;
+  }
+
+  enqueueDiskLoad(chunk, camera = this.lastCamera) {
+    if (
+      !chunk ||
+      chunk.state === CHUNK_STATES.READY ||
+      this.pendingDiskLoads.has(chunk.key) ||
+      this.loadingDiskChunks.has(chunk.key) ||
+      this.pendingChunks.has(chunk.key)
+    ) {
+      return;
+    }
+
+    chunk.state = CHUNK_STATES.QUEUED_DISK_LOAD;
+    chunk.priority = this.getChunkPriority(chunk.chunkX, chunk.chunkY, camera);
+    this.pendingDiskLoads.add(chunk.key);
+    this.diskLoadQueue.push(chunk);
+  }
+
+  enqueueBakedImageLoad(chunk, camera = this.lastCamera) {
+    if (
+      !chunk ||
+      chunk.state === CHUNK_STATES.READY ||
+      this.pendingBakedImages.has(chunk.key) ||
+      this.loadingBakedImages.has(chunk.key) ||
+      this.pendingDiskLoads.has(chunk.key) ||
+      this.pendingChunks.has(chunk.key)
+    ) {
+      return;
+    }
+
+    chunk.state = CHUNK_STATES.QUEUED_DISK_LOAD;
+    chunk.priority = this.getChunkPriority(chunk.chunkX, chunk.chunkY, camera);
+    this.pendingBakedImages.add(chunk.key);
+    this.bakedImageQueue.push(chunk);
+  }
+
+  enqueueChunk(chunk, camera = this.lastCamera) {
+    this.enqueueChunkGeneration(chunk, camera);
+  }
+
+  enqueueChunkGeneration(chunk, camera = this.lastCamera) {
+    if (!chunk || chunk.state === CHUNK_STATES.READY || this.pendingChunks.has(chunk.key)) {
+      return;
+    }
+
+    chunk.state = CHUNK_STATES.QUEUED_GENERATION;
+    chunk.priority = this.getChunkPriority(chunk.chunkX, chunk.chunkY, camera);
+    this.pendingChunks.add(chunk.key);
+    this.chunkQueue.push(chunk);
+  }
+
+  getChunkPriority(chunkX, chunkY, camera = this.lastCamera) {
+    if (!camera) return 0;
+
+    const chunkCenterX = chunkX * this.chunkSizePx + this.chunkSizePx * 0.5;
+    const chunkCenterY = chunkY * this.chunkSizePx + this.chunkSizePx * 0.5;
+    const dx = chunkCenterX - camera.x;
+    const dy = chunkCenterY - camera.y;
+
+    return dx * dx + dy * dy;
+  }
+
+  sortBuildQueue(camera = this.lastCamera) {
+    for (const chunk of this.chunkQueue) {
+      chunk.priority = this.getChunkPriority(chunk.chunkX, chunk.chunkY, camera);
+    }
+
+    this.chunkQueue.sort((a, b) => a.priority - b.priority);
+  }
+
+  sortDiskLoadQueue(camera = this.lastCamera) {
+    for (const chunk of this.diskLoadQueue) {
+      chunk.priority = this.getChunkPriority(chunk.chunkX, chunk.chunkY, camera);
+    }
+
+    this.diskLoadQueue.sort((a, b) => a.priority - b.priority);
+  }
+
+  sortBakedImageQueue(camera = this.lastCamera) {
+    for (const chunk of this.bakedImageQueue) {
+      chunk.priority = this.getChunkPriority(chunk.chunkX, chunk.chunkY, camera);
+    }
+
+    this.bakedImageQueue.sort((a, b) => a.priority - b.priority);
+  }
+
+  processBakedImageQueue(camera = this.lastCamera) {
+    if (!this.bakedManifest) return;
+
+    this.sortBakedImageQueue(camera);
+    let started = 0;
+    const maxLoads = Math.max(1, this.config.maxDiskLoadsPerFrame ?? 1);
+
+    while (started < maxLoads && this.bakedImageQueue.length) {
+      const chunk = this.bakedImageQueue.shift();
+
+      if (
+        !chunk ||
+        chunk.state === CHUNK_STATES.READY ||
+        !this.pendingBakedImages.has(chunk.key) ||
+        this.loadingBakedImages.has(chunk.key)
+      ) {
+        continue;
+      }
+
+      this.loadChunkFromBakedImage(chunk);
+      started++;
+    }
+  }
+
+  async loadChunkFromBakedImage(chunk) {
+    this.pendingBakedImages.delete(chunk.key);
+    this.loadingBakedImages.add(chunk.key);
+    chunk.state = CHUNK_STATES.LOADING_FROM_DISK;
+
+    try {
+      const path = this.getBakedChunkPath(chunk.chunkX, chunk.chunkY);
+
+      if (path) {
+        const response = await fetch(path, { cache: 'force-cache' });
+
+        if (response.ok) {
+          const blob = await response.blob();
+
+          if (await chunk.restoreFromBlob(blob)) {
+            this.metrics.bakedCache.hits++;
+            this.loadingBakedImages.delete(chunk.key);
+            this.saveChunkToDisk(chunk);
+            this.updateMetrics();
+            return true;
+          }
+        }
+      }
+    } catch (error) {
+      console.warn('[OrganicMapRenderer] Falha ao carregar chunk pre-gerado:', error);
+      this.metrics.bakedCache.errors++;
+    }
+
+    this.metrics.bakedCache.misses++;
+    this.loadingBakedImages.delete(chunk.key);
+
+    if (this.diskCache?.ready) {
+      this.enqueueDiskLoad(chunk, this.lastCamera);
+    } else {
+      this.enqueueChunkGeneration(chunk, this.lastCamera);
+    }
+
+    this.updateMetrics();
+    return false;
+  }
+
+  processDiskLoadQueue(camera = this.lastCamera) {
+    if (!this.diskCache?.ready) return;
+
+    this.sortDiskLoadQueue(camera);
+    let started = 0;
+    const maxLoads = Math.max(1, this.config.maxDiskLoadsPerFrame ?? 1);
+
+    while (started < maxLoads && this.diskLoadQueue.length) {
+      const chunk = this.diskLoadQueue.shift();
+
+      if (
+        !chunk ||
+        chunk.state === CHUNK_STATES.READY ||
+        !this.pendingDiskLoads.has(chunk.key) ||
+        this.loadingDiskChunks.has(chunk.key)
+      ) {
+        continue;
+      }
+
+      this.loadChunkFromDisk(chunk);
+      started++;
+    }
+  }
+
+  async loadChunkFromDisk(chunk) {
+    this.pendingDiskLoads.delete(chunk.key);
+    this.loadingDiskChunks.add(chunk.key);
+    chunk.state = CHUNK_STATES.LOADING_FROM_DISK;
+
+    try {
+      const blob = await this.diskCache.getChunkBlob(chunk.cacheKey);
+
+      if (blob && await chunk.restoreFromBlob(blob)) {
+        this.loadingDiskChunks.delete(chunk.key);
+        this.updateMetrics();
+        return true;
+      }
+    } catch (error) {
+      console.warn('[OrganicMapRenderer] Falha ao carregar chunk do disco:', error);
+      this.diskCache.metrics.errors++;
+    }
+
+    this.loadingDiskChunks.delete(chunk.key);
+    this.enqueueChunkGeneration(chunk, this.lastCamera);
+    this.updateMetrics();
+    return false;
+  }
+
+  nextQueuedChunk(camera = this.lastCamera) {
+    this.sortBuildQueue(camera);
+
+    while (this.chunkQueue.length) {
+      const chunk = this.chunkQueue.shift();
+
+      if (!chunk || chunk.state === CHUNK_STATES.READY || !this.pendingChunks.has(chunk.key)) {
+        continue;
+      }
+
+      return chunk;
+    }
+
+    return null;
+  }
+
+  processBuildQueue(timeBudgetMs = this.runtimeChunkBudgetMs, camera = this.lastCamera) {
+    const start = performance.now();
+    const deadline = start + timeBudgetMs;
+    let builtThisFrame = 0;
+
+    this.metrics.chunksBuiltThisFrame = 0;
+
+    while (builtThisFrame < this.maxChunksBuiltPerFrame) {
+      const chunk = this.currentBuildChunk ?? this.nextQueuedChunk(camera);
+
+      if (!chunk) break;
+
+      this.currentBuildChunk = chunk;
+      this.buildingChunks.add(chunk.key);
+      const done = chunk.buildStep(deadline);
+
+      if (!done) break;
+
+      this.pendingChunks.delete(chunk.key);
+      this.buildingChunks.delete(chunk.key);
+      this.currentBuildChunk = null;
+      this.saveChunkToDisk(chunk);
+      builtThisFrame++;
+
+      if (performance.now() >= deadline) break;
+    }
+
+    this.metrics.chunksBuiltThisFrame = builtThisFrame;
+  }
+
+  async loadOrBuildChunkSync(cx, cy) {
+    const chunk = this.getOrCreateChunk(cx, cy, { buildNow: false });
+
+    this.pendingDiskLoads.delete(chunk.key);
+    this.loadingDiskChunks.delete(chunk.key);
+    this.pendingBakedImages.delete(chunk.key);
+    this.loadingBakedImages.delete(chunk.key);
+    this.pendingChunks.delete(chunk.key);
+    this.buildingChunks.delete(chunk.key);
+    this.diskLoadQueue = this.diskLoadQueue.filter((queued) => queued.key !== chunk.key);
+    this.bakedImageQueue = this.bakedImageQueue.filter((queued) => queued.key !== chunk.key);
+    this.chunkQueue = this.chunkQueue.filter((queued) => queued.key !== chunk.key);
+
+    if (chunk.state === CHUNK_STATES.READY) {
+      return { chunk, source: 'ram' };
+    }
+
+    const bakedPath = this.getBakedChunkPath(cx, cy);
+
+    if (bakedPath) {
+      try {
+        const response = await fetch(bakedPath, { cache: 'force-cache' });
+
+        if (response.ok && await chunk.restoreFromBlob(await response.blob())) {
+          this.metrics.bakedCache.hits++;
+          await this.saveChunkToDisk(chunk);
+          return { chunk, source: 'baked' };
+        }
+      } catch (error) {
+        this.metrics.bakedCache.errors++;
+      }
+    }
+
+    if (this.diskCache?.ready) {
+      const blob = await this.diskCache.getChunkBlob(chunk.cacheKey);
+
+      if (blob && await chunk.restoreFromBlob(blob)) {
+        this.metrics.prewarmDiskHits++;
+        return { chunk, source: 'disk' };
+      }
+    }
+
+    chunk.buildSync();
+    this.metrics.prewarmGenerated++;
+    await this.saveChunkToDisk(chunk);
+    return { chunk, source: 'generated' };
+  }
+
+  async saveChunkToDisk(chunk) {
+    if (!this.diskCache?.ready || chunk.state !== CHUNK_STATES.READY) {
+      return false;
+    }
+
+    try {
+      const blob = await chunk.toBlob(
+        this.config.imageFormat,
+        this.config.imageQuality,
+        this.config.fallbackImageFormat
+      );
+
+      if (!blob) return false;
+
+      return this.diskCache.putChunkBlob(chunk.cacheKey, blob, {
+        chunkX: chunk.chunkX,
+        chunkY: chunk.chunkY
+      });
+    } catch (error) {
+      console.warn('[OrganicMapRenderer] Falha ao persistir chunk:', error);
+      this.diskCache.metrics.errors++;
+      return false;
+    }
+  }
+
+  async prewarmAroundWorld(worldX, worldY, options = {}) {
+    const radiusChunks = options.radiusChunks ?? this.config.preloadRadiusChunks;
+    const yieldEvery = Math.max(1, options.yieldEvery ?? 1);
+    const onProgress = options.onProgress ?? null;
+    const centerChunkX = Math.floor(worldX / this.chunkSizePx);
+    const centerChunkY = Math.floor(worldY / this.chunkSizePx);
+    const coords = [];
+
+    for (let cy = centerChunkY - radiusChunks; cy <= centerChunkY + radiusChunks; cy++) {
+      for (let cx = centerChunkX - radiusChunks; cx <= centerChunkX + radiusChunks; cx++) {
+        coords.push({ cx, cy });
+      }
+    }
+
+    coords.sort((a, b) => {
+      const da = Math.abs(a.cx - centerChunkX) + Math.abs(a.cy - centerChunkY);
+      const db = Math.abs(b.cx - centerChunkX) + Math.abs(b.cy - centerChunkY);
+      return da - db;
+    });
+
+    this.metrics.prewarmTotal = coords.length;
+    this.metrics.prewarmProgress = 0;
+
+    for (let i = 0; i < coords.length; i++) {
+      const { cx, cy } = coords[i];
+      await this.loadOrBuildChunkSync(cx, cy);
+
+      this.metrics.prewarmProgress = i + 1;
+      this.updateMetrics();
+
+      if (onProgress) {
+        onProgress((i + 1) / coords.length, {
+          built: i + 1,
+          total: coords.length
+        });
+      }
+
+      if ((i + 1) % yieldEvery === 0) {
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+      }
+    }
+  }
+
+  recordChunkMetrics(elapsed, counts) {
+    this.metrics.chunksBuilt++;
+    this.metrics.chunkCreateMsTotal += elapsed;
+    this.metrics.chunkCreateMsAvg =
+      this.metrics.chunkCreateMsTotal / Math.max(1, this.metrics.chunksBuilt);
+    this.metrics.avgChunkBuildMs = this.metrics.chunkCreateMsAvg;
+    this.metrics.lastChunkBuildMs = elapsed;
+
+    for (const [visualLayer, count] of Object.entries(counts)) {
+      this.metrics.visualLayerCounts[visualLayer] = (this.metrics.visualLayerCounts[visualLayer] ?? 0) + count;
+    }
+
+    this.updateMetrics();
+  }
+
+  updateMetrics() {
+    this.metrics.chunksCached = this.chunks.size;
+    this.metrics.chunksVisible = this.activeSprites.size;
+    this.metrics.queuedChunks = this.pendingChunks.size;
+    this.metrics.queuedDiskLoads = this.pendingDiskLoads.size + this.pendingBakedImages.size;
+    this.metrics.buildingChunks =
+      this.buildingChunks.size + this.loadingDiskChunks.size + this.loadingBakedImages.size;
+    this.metrics.diskCache = this.diskCache?.metrics ?? this.metrics.diskCache;
+    this.metrics.organic.visibleChunks = this.metrics.chunksVisible;
+    this.metrics.organic.cachedChunks = this.metrics.chunksCached;
+    this.metrics.organic.queuedChunks = this.metrics.queuedChunks;
+    this.metrics.organic.queuedBuilds = this.metrics.queuedChunks;
+    this.metrics.organic.queuedDiskLoads = this.metrics.queuedDiskLoads;
+    this.metrics.organic.buildingChunks = this.metrics.buildingChunks;
+    this.metrics.organic.chunksBuiltThisFrame = this.metrics.chunksBuiltThisFrame;
+    this.metrics.organic.chunkCreateMsAvg = this.metrics.chunkCreateMsAvg;
+    this.metrics.organic.avgChunkBuildMs = this.metrics.avgChunkBuildMs;
+    this.metrics.organic.lastChunkBuildMs = this.metrics.lastChunkBuildMs;
+    this.metrics.organic.prewarmProgress = this.metrics.prewarmProgress;
+    this.metrics.organic.prewarmTotal = this.metrics.prewarmTotal;
+    this.metrics.organic.prewarmDiskHits = this.metrics.prewarmDiskHits;
+    this.metrics.organic.prewarmGenerated = this.metrics.prewarmGenerated;
+    this.metrics.organic.cacheHits = this.metrics.cacheHits;
+    this.metrics.organic.cacheMisses = this.metrics.cacheMisses;
+    this.metrics.organic.diskCache = this.metrics.diskCache;
+    this.metrics.organic.bakedCache = this.metrics.bakedCache;
+    this.metrics.organic.configHash = this.diskCache?.configHash ?? this.metrics.organic.configHash;
+    this.metrics.organic.cacheVersion = this.diskCache?.cacheVersion ?? this.metrics.organic.cacheVersion;
+  }
+
+  trimCache(camera) {
+    if (this.chunks.size <= this.config.maxCachedChunks) return;
+
+    const entries = [...this.chunks.entries()].map(([key, chunk]) => {
+      const dx = chunk.worldX + this.chunkSizePx * 0.5 - camera.x;
+      const dy = chunk.worldY + this.chunkSizePx * 0.5 - camera.y;
+
+      return {
+        key,
+        chunk,
+        distSq: dx * dx + dy * dy
+      };
+    });
+
+    entries.sort((a, b) => b.distSq - a.distSq);
+
+    while (this.chunks.size > this.config.maxCachedChunks && entries.length) {
+      const entry = entries.shift();
+
+      if (
+        this.activeSprites.has(entry.chunk.sprite) ||
+        this.pendingBakedImages.has(entry.key) ||
+        this.loadingBakedImages.has(entry.key) ||
+        this.pendingDiskLoads.has(entry.key) ||
+        this.loadingDiskChunks.has(entry.key) ||
+        this.pendingChunks.has(entry.key) ||
+        this.buildingChunks.has(entry.key) ||
+        this.currentBuildChunk?.key === entry.key
+      ) {
+        continue;
+      }
+
+      entry.chunk.destroy();
+      this.chunks.delete(entry.key);
+    }
+  }
+}

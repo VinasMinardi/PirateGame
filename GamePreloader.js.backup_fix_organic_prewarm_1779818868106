@@ -1,0 +1,114 @@
+function nextFrame() {
+  return new Promise((resolve) => requestAnimationFrame(resolve));
+}
+
+export class LoadingOverlay {
+  constructor() {
+    this.element = document.createElement('div');
+    this.element.className = 'loading-overlay';
+    this.element.innerHTML = `
+      <div class="loading-panel">
+        <div class="loading-title">Infinity V3</div>
+        <div class="loading-message">Preparando mundo...</div>
+        <div class="loading-bar">
+          <div class="loading-bar-fill"></div>
+        </div>
+        <div class="loading-percent">0%</div>
+      </div>
+    `;
+
+    this.messageElement = this.element.querySelector('.loading-message');
+    this.fillElement = this.element.querySelector('.loading-bar-fill');
+    this.percentElement = this.element.querySelector('.loading-percent');
+
+    document.body.appendChild(this.element);
+  }
+
+  setProgress(progress, message) {
+    const value = Math.max(0, Math.min(1, progress));
+
+    if (message) {
+      this.messageElement.textContent = message;
+    }
+
+    this.fillElement.style.width = `${Math.round(value * 100)}%`;
+    this.percentElement.textContent = `${Math.round(value * 100)}%`;
+  }
+
+  destroy() {
+    this.element.classList.add('loading-overlay--done');
+
+    setTimeout(() => {
+      this.element.remove();
+    }, 260);
+  }
+}
+
+export class GamePreloader {
+  constructor({ renderer, onProgress = null }) {
+    this.renderer = renderer;
+    this.onProgress = onProgress;
+    this.progress = 0;
+    this.message = 'Preparando mundo...';
+  }
+
+  async run(spawn) {
+    this.report(0.02, 'Preparando mundo...');
+    await nextFrame();
+
+    this.report(0.08, 'Carregando cache do mapa...');
+    await this.renderer?.organicMapRenderer?.initDiskCache?.();
+    await this.renderer?.organicMapRenderer?.initBakedChunkCache?.();
+    await nextFrame();
+
+    this.report(0.72, 'Preparando chunks iniciais...');
+    await this.prewarmChunksAroundSpawn(spawn);
+
+    this.report(0.90, 'Preparando minimapa...');
+    await this.prewarmOrganicMinimap(spawn);
+
+    this.report(0.97, 'Preparando atlas visual...');
+    await this.prewarmTerrainAtlas();
+
+    this.report(1, 'Pronto para zarpar.');
+    await nextFrame();
+  }
+
+  report(progress, message = this.message) {
+    this.progress = progress;
+    this.message = message;
+
+    if (this.onProgress) {
+      this.onProgress(progress, message);
+    }
+  }
+
+  async prewarmChunksAroundSpawn(spawn) {
+    if (!this.renderer?.organicMapRenderer?.prewarmAroundWorld) return;
+
+    await this.renderer.organicMapRenderer.prewarmAroundWorld(spawn.x, spawn.y, {
+      radiusChunks: this.renderer.organicMapRenderer.config?.preloadRadiusChunks ?? 4,
+      yieldEvery: 1,
+      onProgress: (progress, details = null) => {
+        const suffix = details ? ` ${details.built}/${details.total}` : '';
+        this.report(0.72 + progress * 0.18, `Preparando mapa organico...${suffix}`);
+      }
+    });
+  }
+
+  async prewarmTerrainAtlas() {
+    await nextFrame();
+  }
+
+  async prewarmOrganicMinimap(spawn = null) {
+    if (!this.renderer?.organicMinimapRenderer?.prewarm) return;
+
+    await this.renderer.organicMinimapRenderer.prewarm({
+      worldX: spawn?.x,
+      worldY: spawn?.y,
+      onProgress: (progress) => {
+        this.report(0.90 + progress * 0.07, 'Preparando minimapa organico...');
+      }
+    });
+  }
+}

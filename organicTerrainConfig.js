@@ -1,0 +1,110 @@
+import { worldConfig } from '../../../shared/config/worldConfig.js';
+
+export const ORGANIC_MAP_RENDER_MODE = 'organic_map_prototype';
+
+export const ORGANIC_RENDER_QUALITY = {
+  visualCellSize: 2,
+  performanceVisualCellSize: 4,
+  supersampling: 2,
+  smoothBandEdges: true,
+  bandBlendWidth: 0.035
+};
+
+export const ORGANIC_CHUNK_CACHE_CONFIG = {
+  chunkSizePx: 1024,
+  preloadRadiusChunks: 4,
+  runtimePreloadRadiusChunks: 2,
+  maxCachedChunks: 384,
+  runtimeChunkBudgetMs: 12,
+  maxChunksBuiltPerFrame: 2,
+  placeholderEnabled: true
+};
+
+export const ORGANIC_CACHE_CONFIG = {
+  persistentCacheEnabled: true,
+  cacheVersion: 'organic-dev-v3-prewarm-fix',
+  imageFormat: 'image/webp',
+  imageQuality: 0.88,
+  fallbackImageFormat: 'image/png',
+  maxPersistentChunks: 1200,
+  maxPersistentBytes: 512 * 1024 * 1024,
+  pruneOnStartup: true,
+  requestPersistentStorage: true,
+  maxDiskLoadsPerFrame: 2
+};
+
+export const ORGANIC_BAKE_CONFIG = {
+  enabled: false,
+  cacheVersion: ORGANIC_CACHE_CONFIG.cacheVersion,
+  outputDir: 'public/generated/organic-map',
+  imageFormat: 'image/png',
+  imageQuality: 0.9,
+  generateMode: 'missing',
+  chunkSizePx: ORGANIC_CHUNK_CACHE_CONFIG.chunkSizePx
+};
+
+export const organicTerrainConfig = {
+  seed: worldConfig.seed ?? 421337,
+  worldWidth: 81920,
+  worldHeight: 81920,
+
+  chunkSizePx: ORGANIC_CHUNK_CACHE_CONFIG.chunkSizePx,
+  visualCellSize: ORGANIC_RENDER_QUALITY.visualCellSize,
+  supersampling: ORGANIC_RENDER_QUALITY.supersampling,
+  smoothBandEdges: ORGANIC_RENDER_QUALITY.smoothBandEdges,
+  bandBlendWidth: ORGANIC_RENDER_QUALITY.bandBlendWidth,
+  maxCachedChunks: ORGANIC_CHUNK_CACHE_CONFIG.maxCachedChunks,
+  preloadRadiusChunks: ORGANIC_CHUNK_CACHE_CONFIG.preloadRadiusChunks,
+  runtimePreloadRadiusChunks: ORGANIC_CHUNK_CACHE_CONFIG.runtimePreloadRadiusChunks,
+  preloadChunks: ORGANIC_CHUNK_CACHE_CONFIG.runtimePreloadRadiusChunks,
+  runtimeChunkBudgetMs: ORGANIC_CHUNK_CACHE_CONFIG.runtimeChunkBudgetMs,
+  maxChunksBuiltPerFrame: ORGANIC_CHUNK_CACHE_CONFIG.maxChunksBuiltPerFrame,
+  placeholderEnabled: ORGANIC_CHUNK_CACHE_CONFIG.placeholderEnabled,
+  persistentCacheEnabled: ORGANIC_CACHE_CONFIG.persistentCacheEnabled,
+  cacheVersion: ORGANIC_CACHE_CONFIG.cacheVersion,
+  imageFormat: ORGANIC_CACHE_CONFIG.imageFormat,
+  imageQuality: ORGANIC_CACHE_CONFIG.imageQuality,
+  fallbackImageFormat: ORGANIC_CACHE_CONFIG.fallbackImageFormat,
+  maxDiskLoadsPerFrame: ORGANIC_CACHE_CONFIG.maxDiskLoadsPerFrame,
+  bakedChunksEnabled: ORGANIC_BAKE_CONFIG.enabled,
+  bakedOutputDir: ORGANIC_BAKE_CONFIG.outputDir,
+
+  continentalScale: 0.0004,
+  islandScale: 0.00095,
+  mediumScale: 0.0027,
+  detailScale: 0.009,
+
+  octaves: 5,
+  lacunarity: 2.0,
+  gain: 0.5,
+
+  domainWarpStrength: 275,
+  domainWarpScale: 0.00078,
+  detailHeightWeight: 0.028,
+  detailColorStrength: 0.028,
+
+  seaLevel: 0.545,
+  thresholds: {
+    deepWater: 0.40,
+    shallowWater: 0.48,
+    wetSand: 0.51,
+    beach: 0.58,
+    land: 0.78
+  },
+
+  colors: {
+    deep_water: '#0b3f66',
+    deep_water_dark: '#082f4d',
+    shallow_water: '#33bdd2',
+    shallow_water_light: '#6edee8',
+    wet_sand: '#c49a5a',
+    beach: '#e8c982',
+    beach_light: '#f0d99a',
+    land: '#4f8f3a',
+    forest: '#2f6532',
+    forest_dark: '#244d29'
+  },
+
+  enableRaycastShadows: false,
+  enableDecoration: false
+};
